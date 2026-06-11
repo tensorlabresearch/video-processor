@@ -3,3 +3,5 @@ uvicorn[standard]==0.30.6
 faster-whisper==1.0.3
 requests>=2.31.0
 yt-dlp>=2024.11.18
+pypdf>=4.0.0
+readability-lxml>=0.8.1

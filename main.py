@@ -1,10 +1,12 @@
 import asyncio
+import io
 import logging
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
+import requests
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -74,6 +76,70 @@ async def process_video(body: dict) -> JSONResponse:
         "duration_seconds": duration,
         "language": language,
     })
+
+
+@app.post("/fetch")
+async def fetch_url(body: dict) -> JSONResponse:
+    url = body.get("url", "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "url is required"})
+
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _fetch_and_extract(url)),
+            timeout=60,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"error": "fetch timed out after 60s"})
+    except Exception as exc:
+        logger.error("fetch failed for %s: %s", url, exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    return JSONResponse(result)
+
+
+def _fetch_and_extract(url: str) -> dict:
+    logger.info("Fetching %s", url)
+    resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "")
+    logger.info("Content-Type: %s (%d bytes)", content_type, len(resp.content))
+
+    if "pdf" in content_type or url.lower().endswith(".pdf"):
+        return _extract_pdf(resp.content, url)
+    else:
+        return _extract_html(resp.text, url)
+
+
+def _extract_pdf(data: bytes, url: str) -> dict:
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    pages_text = []
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            pages_text.append(t)
+    text = "\n\n".join(pages_text)
+    title = (reader.metadata.title or "").strip() if reader.metadata else ""
+    if not title:
+        title = url.split("/")[-1]
+    logger.info("PDF extracted: %d pages, %d chars", len(reader.pages), len(text))
+    return {"text": text, "title": title, "content_type": "application/pdf", "char_count": len(text)}
+
+
+def _extract_html(html: str, url: str) -> dict:
+    from readability import Document
+    doc = Document(html)
+    title = doc.title() or ""
+    # readability returns HTML summary; strip tags for plain text
+    import re
+    raw = doc.summary()
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    logger.info("HTML extracted: title=%r %d chars", title, len(text))
+    return {"text": text, "title": title, "content_type": "text/html", "char_count": len(text)}
 
 
 async def _download_audio(url: str, output_path: Path) -> str:
