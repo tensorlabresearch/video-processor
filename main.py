@@ -20,17 +20,25 @@ logger = logging.getLogger("video-processor")
 
 MODEL_SIZE = os.environ.get("MODEL_SIZE", "large-v3")
 PORT = int(os.environ.get("PORT", "8082"))
+# Max concurrent video processing jobs. GPU runs one Whisper job efficiently;
+# queue up to this many waiters before returning 429.
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
+# How long a caller waits to acquire the semaphore before getting 429.
+QUEUE_TIMEOUT = float(os.environ.get("QUEUE_TIMEOUT_SECS", "30"))
 
 app = FastAPI(title="video-processor")
 
 # Global model state — set to True after startup completes loading
 _model: WhisperModel | None = None
 _model_loaded: bool = False
+# Serialises GPU-intensive work so the model isn't hit concurrently.
+_process_semaphore: asyncio.Semaphore | None = None
 
 
 @app.on_event("startup")
 async def load_model() -> None:
-    global _model, _model_loaded
+    global _model, _model_loaded, _process_semaphore
+    _process_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     logger.info("Loading Whisper model %s on CUDA (float16) ...", MODEL_SIZE)
     # Run blocking model init in a thread so the event loop stays responsive
     loop = asyncio.get_event_loop()
@@ -39,12 +47,15 @@ async def load_model() -> None:
         lambda: WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16"),
     )
     _model_loaded = True
-    logger.info("Whisper model loaded successfully")
+    logger.info("Whisper model loaded successfully (max_concurrent=%d, queue_timeout=%.0fs)",
+                MAX_CONCURRENT, QUEUE_TIMEOUT)
 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    return JSONResponse({"status": "ok", "model_loaded": _model_loaded})
+    sem = _process_semaphore
+    queued = (MAX_CONCURRENT - sem._value) if sem else 0
+    return JSONResponse({"status": "ok", "model_loaded": _model_loaded, "active_jobs": queued})
 
 
 @app.post("/process")
@@ -56,26 +67,38 @@ async def process_video(body: dict) -> JSONResponse:
     if not _model_loaded or _model is None:
         return JSONResponse(status_code=503, content={"error": "model not yet loaded"})
 
-    with tempfile.TemporaryDirectory() as tmp:
-        audio_path = Path(tmp) / "audio.wav"
-        try:
-            title = await _download_audio(url, audio_path)
-        except Exception as exc:
-            logger.error("yt-dlp download failed for %s: %s", url, exc)
-            return JSONResponse(status_code=500, content={"error": str(exc)})
+    try:
+        acquired = await asyncio.wait_for(_process_semaphore.acquire(), timeout=QUEUE_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("Rate limit: semaphore not acquired within %.0fs for %s", QUEUE_TIMEOUT, url)
+        return JSONResponse(
+            status_code=429,
+            content={"error": f"server busy — try again in a few minutes"},
+        )
 
-        try:
-            transcript, language, duration = await _transcribe(audio_path)
-        except Exception as exc:
-            logger.error("Whisper transcription failed: %s", exc)
-            return JSONResponse(status_code=500, content={"error": str(exc)})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "audio.wav"
+            try:
+                title = await _download_audio(url, audio_path)
+            except Exception as exc:
+                logger.error("yt-dlp download failed for %s: %s", url, exc)
+                return JSONResponse(status_code=500, content={"error": str(exc)})
 
-    return JSONResponse({
-        "transcript": transcript,
-        "title": title,
-        "duration_seconds": duration,
-        "language": language,
-    })
+            try:
+                transcript, language, duration = await _transcribe(audio_path)
+            except Exception as exc:
+                logger.error("Whisper transcription failed: %s", exc)
+                return JSONResponse(status_code=500, content={"error": str(exc)})
+
+        return JSONResponse({
+            "transcript": transcript,
+            "title": title,
+            "duration_seconds": duration,
+            "language": language,
+        })
+    finally:
+        _process_semaphore.release()
 
 
 @app.post("/fetch")
